@@ -36,6 +36,7 @@
 // -DUSE_PEXT    | Add runtime support for use of pext asm-instruction. Works
 //               | only in 64-bit mode and requires hardware with pext support.
 
+    #include <array>
     #include <cassert>
     #include <cstddef>
     #include <cstdint>
@@ -337,10 +338,43 @@ struct DirtyThreat {
 
 using DirtyThreatList = ValueList<DirtyThreat, 96>;
 
+// A deferred board operation recorded by do_move and replayed by
+// DirtyThreats::materialize() to generate the dirty threat list lazily.
+struct ThreatUpdateOp {
+    enum Kind : u8 {
+        Remove,
+        Put,
+        Move,
+        Swap
+    };
+    Kind   kind;
+    Piece  pc;  // Put/Swap only
+    Square from, to;
+};
+
 struct DirtyThreats {
     DirtyThreatList list;
     Color           us;
     Square          prevKsq, ksq;
+
+    Bitboard threatenedSqs, threateningSqs;
+
+    // Lazy materialization: half of all generated dirty threat lists are
+    // never consumed, so do_move only snapshots the pre-move board state
+    // and the op sequence; the list is generated on first use.
+    std::array<Piece, SQUARE_NB>        snapBoard;
+    std::array<Bitboard, PIECE_TYPE_NB> snapByType;
+    std::array<Bitboard, COLOR_NB>      snapByColor;
+    std::array<ThreatUpdateOp, 4>       ops;
+    u8                                  numOps  = 0;
+    bool                                pending = false;
+
+    void push_op(ThreatUpdateOp op) {
+        assert(numOps < 4);
+        ops[numOps++] = op;
+    }
+
+    void materialize();  // defined in position.cpp
 };
 
     #define ENABLE_INCR_OPERATORS_ON(T) \

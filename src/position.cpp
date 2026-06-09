@@ -862,12 +862,18 @@ void Position::do_move(Move                      m,
     Piece  pc       = piece_on(from);
     Piece  captured = m.type_of() == EN_PASSANT ? make_piece(them, PAWN) : piece_on(to);
 
-    dp.pc       = pc;
-    dp.from     = from;
-    dp.to       = to;
-    dp.add_sq   = SQ_NONE;
-    dts.us      = us;
-    dts.prevKsq = square<KING>(us);
+    dp.pc             = pc;
+    dp.from           = from;
+    dp.to             = to;
+    dp.add_sq         = SQ_NONE;
+    dts.us            = us;
+    dts.prevKsq       = square<KING>(us);
+    dts.threatenedSqs = dts.threateningSqs = 0;
+    dts.numOps        = 0;
+    dts.pending       = true;
+    dts.snapBoard   = board;
+    dts.snapByType  = byTypeBB;
+    dts.snapByColor = byColorBB;
 
     assert(color_of(pc) == us);
     assert(captured == NO_PIECE || color_of(captured) == (m.type_of() != CASTLING ? them : us));
@@ -1152,23 +1158,26 @@ void Position::undo_move(Move m) {
     assert(pos_is_ok());
 }
 
-inline void add_dirty_threat(DirtyThreats* const dts,
-                             bool                putPiece,
-                             Piece               pc,
-                             Piece               threatened,
-                             Square              s,
-                             Square              threatenedSq) {
-    dts->list.push_back({pc, threatened, s, threatenedSq, putPiece});
+template<bool PutPiece>
+inline void add_dirty_threat(
+  DirtyThreats* const dts, Piece pc, Piece threatened, Square s, Square threatenedSq) {
+    if (PutPiece)
+    {
+        dts->threatenedSqs |= threatenedSq;
+        dts->threateningSqs |= s;
+    }
+
+    dts->list.push_back({pc, threatened, s, threatenedSq, PutPiece});
 }
 
 #ifdef USE_AVX512ICL
 // Given a DirtyThreat template and bit offsets to insert the piece type and square, write the threats
 // present at the given bitboard.
-template<int SqShift, int PcShift>
-void write_multiple_dirties(const Position& p,
-                            Bitboard        mask,
-                            DirtyThreat     dt_template,
-                            DirtyThreats*   dts) {
+template<int SqShift, int PcShift, typename B>
+void write_multiple_dirties(const B&      p,
+                            Bitboard      mask,
+                            DirtyThreat   dt_template,
+                            DirtyThreats* dts) {
     static_assert(sizeof(DirtyThreat) == 4);
 
     const __m512i board    = _mm512_loadu_si512(p.piece_array().data());
@@ -1196,19 +1205,56 @@ void write_multiple_dirties(const Position& p,
 }
 #endif
 
-template<bool ComputeRay>
-void Position::update_piece_threats(Piece               pc,
-                                    bool                putPiece,
-                                    Square              s,
-                                    DirtyThreats* const dts,
-                                    // Silence spurious warning on GCC 10
-                                    [[maybe_unused]] Bitboard noRaysContaining) const {
-    const Bitboard occupied     = pieces();
-    const Bitboard rookQueens   = pieces(ROOK, QUEEN);
-    const Bitboard bishopQueens = pieces(BISHOP, QUEEN);
+// Board state provider for replaying deferred threat updates: the pre-move
+// snapshot taken by do_move, advanced through the recorded op sequence.
+struct ThreatBoard {
+    std::array<Piece, SQUARE_NB>&        board;
+    std::array<Bitboard, PIECE_TYPE_NB>& byTypeBB;
+    std::array<Bitboard, COLOR_NB>&      byColorBB;
+
+    Piece                               piece_on(Square s) const { return board[s]; }
+    const std::array<Piece, SQUARE_NB>& piece_array() const { return board; }
+    Bitboard                            pieces() const { return byTypeBB[ALL_PIECES]; }
+    Bitboard                            pieces(PieceType pt) const { return byTypeBB[pt]; }
+    Bitboard pieces(PieceType pt1, PieceType pt2) const { return byTypeBB[pt1] | byTypeBB[pt2]; }
+    Bitboard pieces(Color c, PieceType pt) const { return byColorBB[c] & byTypeBB[pt]; }
+
+    void put(Piece pc, Square s) {
+        board[s] = pc;
+        byTypeBB[ALL_PIECES] |= byTypeBB[type_of(pc)] |= s;
+        byColorBB[color_of(pc)] |= s;
+    }
+    void remove(Square s) {
+        Piece pc = board[s];
+        byTypeBB[ALL_PIECES] ^= s;
+        byTypeBB[type_of(pc)] ^= s;
+        byColorBB[color_of(pc)] ^= s;
+        board[s] = NO_PIECE;
+    }
+    void move(Square from, Square to) {
+        Piece    pc     = board[from];
+        Bitboard fromTo = from | to;
+        byTypeBB[ALL_PIECES] ^= fromTo;
+        byTypeBB[type_of(pc)] ^= fromTo;
+        byColorBB[color_of(pc)] ^= fromTo;
+        board[from] = NO_PIECE;
+        board[to]   = pc;
+    }
+};
+
+template<bool PutPiece, bool ComputeRay, typename B>
+void update_piece_threats(const B&            b,
+                          Piece               pc,
+                          Square              s,
+                          DirtyThreats* const dts,
+                          // Silence spurious warning on GCC 10
+                          [[maybe_unused]] Bitboard noRaysContaining = -1ULL) {
+    const Bitboard occupied     = b.pieces();
+    const Bitboard rookQueens   = b.pieces(ROOK, QUEEN);
+    const Bitboard bishopQueens = b.pieces(BISHOP, QUEEN);
     const Bitboard rAttacks     = attacks_bb<ROOK>(s, occupied);
     const Bitboard bAttacks     = attacks_bb<BISHOP>(s, occupied);
-    const Bitboard kings        = pieces(KING);
+    const Bitboard kings        = b.pieces(KING);
     Bitboard       occupiedNoK  = occupied ^ kings;
 
     Bitboard sliders         = (rookQueens & rAttacks) | (bishopQueens & bAttacks);
@@ -1216,7 +1262,7 @@ void Position::update_piece_threats(Piece               pc,
         while (sliders)
         {
             Square sliderSq = pop_lsb(sliders);
-            Piece  slider   = piece_on(sliderSq);
+            Piece  slider   = b.piece_on(sliderSq);
 
             const Bitboard ray        = ray_pass_bb(sliderSq, s);
             const Bitboard discovered = ray & (rAttacks | bAttacks) & occupiedNoK;
@@ -1225,12 +1271,12 @@ void Position::update_piece_threats(Piece               pc,
             if (discovered && (ray_pass_bb(sliderSq, s) & noRaysContaining) != noRaysContaining)
             {
                 const Square threatenedSq = lsb(discovered);
-                const Piece  threatenedPc = piece_on(threatenedSq);
-                add_dirty_threat(dts, !putPiece, slider, threatenedPc, sliderSq, threatenedSq);
+                const Piece  threatenedPc = b.piece_on(threatenedSq);
+                add_dirty_threat<!PutPiece>(dts, slider, threatenedPc, sliderSq, threatenedSq);
             }
 
             if (addDirectAttacks)
-                add_dirty_threat(dts, putPiece, slider, pc, sliderSq, s);
+                add_dirty_threat<PutPiece>(dts, slider, pc, sliderSq, s);
         }
     };
 
@@ -1242,9 +1288,9 @@ void Position::update_piece_threats(Piece               pc,
     }
 
 
-    const Bitboard knights    = pieces(KNIGHT);
-    const Bitboard whitePawns = pieces(WHITE, PAWN);
-    const Bitboard blackPawns = pieces(BLACK, PAWN);
+    const Bitboard knights    = b.pieces(KNIGHT);
+    const Bitboard whitePawns = b.pieces(WHITE, PAWN);
+    const Bitboard blackPawns = b.pieces(BLACK, PAWN);
 
 
     Bitboard threatened = attacks_bb(pc, s, occupied) & occupiedNoK;
@@ -1258,7 +1304,7 @@ void Position::update_piece_threats(Piece               pc,
         Bitboard whiteAttacks = PawnPushOrAttacks[WHITE][s];
         Bitboard blackAttacks = PawnPushOrAttacks[BLACK][s];
 
-        threatened |= (color_of(pc) == WHITE ? whiteAttacks : blackAttacks) & pieces(PAWN);
+        threatened |= (color_of(pc) == WHITE ? whiteAttacks : blackAttacks) & b.pieces(PAWN);
 
         incoming_threats |= whiteAttacks & blackPawns;
         incoming_threats |= blackAttacks & whitePawns;
@@ -1270,25 +1316,39 @@ void Position::update_piece_threats(Piece               pc,
     }
 
 #ifdef USE_AVX512ICL
-    DirtyThreat dt_template{pc, NO_PIECE, s, Square(0), putPiece};
+    if constexpr (PutPiece)
+    {
+        dts->threatenedSqs |= threatened;
+        // A bit may only be set if that square actually produces a threat, so we
+        // must guard setting the square accordingly
+        dts->threateningSqs |= Bitboard(bool(threatened)) << s;
+    }
+
+    DirtyThreat dt_template{pc, NO_PIECE, s, Square(0), PutPiece};
     write_multiple_dirties<DirtyThreat::ThreatenedSqOffset, DirtyThreat::ThreatenedPcOffset>(
-      *this, threatened, dt_template, dts);
+      b, threatened, dt_template, dts);
 
     Bitboard all_attackers = sliders | incoming_threats;
 
-    dt_template = {NO_PIECE, pc, Square(0), s, putPiece};
-    write_multiple_dirties<DirtyThreat::PcSqOffset, DirtyThreat::PcOffset>(*this, all_attackers,
+    if constexpr (PutPiece)
+    {
+        dts->threatenedSqs |= Bitboard(bool(all_attackers)) << s;  // same as above
+        dts->threateningSqs |= all_attackers;
+    }
+
+    dt_template = {NO_PIECE, pc, Square(0), s, PutPiece};
+    write_multiple_dirties<DirtyThreat::PcSqOffset, DirtyThreat::PcOffset>(b, all_attackers,
                                                                            dt_template, dts);
 #else
     while (threatened)
     {
         Square threatenedSq = pop_lsb(threatened);
-        Piece  threatenedPc = piece_on(threatenedSq);
+        Piece  threatenedPc = b.piece_on(threatenedSq);
 
         assert(threatenedSq != s);
         assert(threatenedPc);
 
-        add_dirty_threat(dts, putPiece, pc, threatenedPc, s, threatenedSq);
+        add_dirty_threat<PutPiece>(dts, pc, threatenedPc, s, threatenedSq);
     }
 #endif
 
@@ -1309,14 +1369,55 @@ void Position::update_piece_threats(Piece               pc,
     while (incoming_threats)
     {
         Square srcSq = pop_lsb(incoming_threats);
-        Piece  srcPc = piece_on(srcSq);
+        Piece  srcPc = b.piece_on(srcSq);
 
         assert(srcSq != s);
         assert(srcPc != NO_PIECE);
 
-        add_dirty_threat(dts, putPiece, srcPc, pc, srcSq, s);
+        add_dirty_threat<PutPiece>(dts, srcPc, pc, srcSq, s);
     }
 #endif
+}
+
+// Generate the dirty threat list recorded lazily by do_move: replay the
+// op sequence against the pre-move snapshot.
+void DirtyThreats::materialize() {
+    assert(pending);
+    pending = false;
+
+    ThreatBoard b{snapBoard, snapByType, snapByColor};
+
+    for (int i = 0; i < numOps; ++i)
+    {
+        const ThreatUpdateOp& op = ops[i];
+        switch (op.kind)
+        {
+        case ThreatUpdateOp::Remove :
+            update_piece_threats<false, true>(b, b.piece_on(op.from), op.from, this);
+            b.remove(op.from);
+            break;
+        case ThreatUpdateOp::Put :
+            b.put(op.pc, op.from);
+            update_piece_threats<true, true>(b, op.pc, op.from, this);
+            break;
+        case ThreatUpdateOp::Move : {
+            const Piece    pc     = b.piece_on(op.from);
+            const Bitboard fromTo = op.from | op.to;
+            update_piece_threats<false, true>(b, pc, op.from, this, fromTo);
+            b.move(op.from, op.to);
+            update_piece_threats<true, true>(b, pc, op.to, this, fromTo);
+            break;
+        }
+        case ThreatUpdateOp::Swap : {
+            const Piece old = b.piece_on(op.from);
+            b.remove(op.from);
+            update_piece_threats<false, false>(b, old, op.from, this);
+            b.put(op.pc, op.from);
+            update_piece_threats<true, false>(b, op.pc, op.from, this);
+            break;
+        }
+        }
+    }
 }
 
 // Helper used to do/undo a castling move. This is a bit

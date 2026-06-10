@@ -647,6 +647,26 @@ void Search::Worker::do_null_move(Position& pos, StateInfo& st, Stack* const ss)
     ss->continuationCorrectionHistory = &continuationCorrectionHistory[NO_PIECE][0];
 }
 
+// Value of the new threats the opponent's last move created against the side
+// to move, derived from the dirty-threat list already computed for the NNUE
+// update. Only valid where the last move was a regular search move.
+int Search::Worker::opponent_threat_gain(const Position& pos) const {
+    const Color us         = pos.side_to_move();
+    int         threatGain = 0;
+    for (const auto& dt : accumulatorStack.latest().dirtyThreats.list)
+    {
+        const Piece attacker = dt.pc();
+        const Piece victim   = dt.threatened_pc();
+        if (!dt.add() || color_of(attacker) == us || color_of(victim) != us)
+            continue;
+        // Skip pawn push pseudo-relations tracked for NNUE
+        if (type_of(attacker) == PAWN && file_of(dt.pc_sq()) == file_of(dt.threatened_sq()))
+            continue;
+        threatGain += PieceValue[victim];
+    }
+    return threatGain;
+}
+
 void Search::Worker::undo_move(Position& pos, const Move move) {
     pos.undo_move(move);
     accumulatorStack.pop();
@@ -974,8 +994,12 @@ Value Search::Worker::search(
     }
 
     // Step 9. Null move search with verification search
-    if (cutNode && ss->staticEval >= beta - 14 * depth - 45 * improving + 374 && !excludedMove
-        && pos.non_pawn_material(us) && ss->ply >= nmpMinPly && !is_loss(beta))
+    // Require a larger static eval surplus when the opponent's last move
+    // created fresh threats against us, as passing would let them execute.
+    if (cutNode
+        && ss->staticEval
+             >= beta - 14 * depth - 45 * improving + 374 + opponent_threat_gain(pos) / 3
+        && !excludedMove && pos.non_pawn_material(us) && ss->ply >= nmpMinPly && !is_loss(beta))
     {
         assert((ss - 1)->currentMove != Move::null());
 

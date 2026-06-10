@@ -372,6 +372,7 @@ class Worker {
     TimePoint elapsed_time() const;
 
     Value evaluate(const Position&);
+    int   opponent_threat_gain(const Position&) const;
 
     LimitsType limits;
 

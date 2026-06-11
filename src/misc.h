@@ -231,6 +231,15 @@ class ValueList {
     const T* end() const { return values_ + size_; }
     const T& operator[](int index) const { return values_[index]; }
 
+    T* data() { return values_; }
+
+    void set_size(usize newSize) {
+        assert(newSize <= MaxSize);
+        size_ = newSize;
+    }
+
+    static constexpr usize capacity() { return MaxSize; }
+
     T* make_space(usize count) {
         T* result = &values_[size_];
         size_ += count;

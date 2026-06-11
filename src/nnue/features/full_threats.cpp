@@ -280,6 +280,14 @@ void FullThreats::append_changed_indices(Color                   perspective,
                                          const ThreatWeightType* prefetchBase,
                                          IndexType               prefetchStride) {
 
+    // Keep both size cursors in registers across the loop: ValueList::push_back_if_lt
+    // would re-load and re-store the size member on every entry, because the compiler
+    // cannot prove the entry stores do not alias it.
+    IndexType* const removedBase = removed.data();
+    IndexType* const addedBase   = added.data();
+    usize            removedSize = removed.size();
+    usize            addedSize   = added.size();
+
     for (const auto& dirty : diff.list)
     {
         auto attacker = dirty.pc();
@@ -318,14 +326,23 @@ void FullThreats::append_changed_indices(Color                   perspective,
             }
         }
 
-        auto&           insert = add ? added : removed;
-        const IndexType index  = make_index(perspective, attacker, from, to, attacked, ksq);
+        const IndexType index = make_index(perspective, attacker, from, to, attacked, ksq);
 
         if (prefetchBase)
             prefetch<PrefetchRw::READ, PrefetchLoc::LOW>(reinterpret_cast<const void*>(
               reinterpret_cast<uintptr_t>(prefetchBase) + index * prefetchStride));
-        insert.push_back_if_lt(index, Dimensions);
+
+        IndexType* const insertBase = add ? addedBase : removedBase;
+        const usize      insertSize = add ? addedSize : removedSize;
+        assert(insertSize < IndexList::capacity());
+        insertBase[insertSize] = index;
+        const usize newSize    = insertSize + (index < Dimensions);
+        addedSize              = add ? newSize : addedSize;
+        removedSize            = add ? removedSize : newSize;
     }
+
+    added.set_size(addedSize);
+    removed.set_size(removedSize);
 }
 
 bool FullThreats::requires_refresh(const DiffType& diff, Color perspective) {

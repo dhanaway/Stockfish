@@ -1211,6 +1211,12 @@ void Position::update_piece_threats(Piece               pc,
     const Bitboard kings        = pieces(KING);
     Bitboard       occupiedNoK  = occupied ^ kings;
 
+    // Threats whose (attacker, victim) class pair has no feature (FullThreats::map < 0)
+    // are never emitted by append_changed_indices; skip recording them entirely.
+    // Direct attacks on a queen by a bishop or rook are such a pair.
+    const Bitboard directExcluded =
+      type_of(pc) == QUEEN ? (bishopQueens ^ rookQueens) : Bitboard(0);
+
     Bitboard sliders         = (rookQueens & rAttacks) | (bishopQueens & bAttacks);
     auto     process_sliders = [&](bool addDirectAttacks) {
         while (sliders)
@@ -1226,10 +1232,12 @@ void Position::update_piece_threats(Piece               pc,
             {
                 const Square threatenedSq = lsb(discovered);
                 const Piece  threatenedPc = piece_on(threatenedSq);
-                add_dirty_threat(dts, !putPiece, slider, threatenedPc, sliderSq, threatenedSq);
+                // Bishop/rook on queen has no feature; queen on queen does
+                if (type_of(threatenedPc) != QUEEN || type_of(slider) == QUEEN)
+                    add_dirty_threat(dts, !putPiece, slider, threatenedPc, sliderSq, threatenedSq);
             }
 
-            if (addDirectAttacks)
+            if (addDirectAttacks && !(directExcluded & sliderSq))
                 add_dirty_threat(dts, putPiece, slider, pc, sliderSq, s);
         }
     };
@@ -1246,10 +1254,16 @@ void Position::update_piece_threats(Piece               pc,
     const Bitboard whitePawns = pieces(WHITE, PAWN);
     const Bitboard blackPawns = pieces(BLACK, PAWN);
 
+    // Victim classes with no feature for this attacker: pawns never threaten
+    // bishops/queens featurewise, minors/rooks never threaten queens.
+    const Bitboard excludedVictims = type_of(pc) == PAWN ? bishopQueens
+                                   : type_of(pc) == BISHOP || type_of(pc) == ROOK
+                                     ? (bishopQueens & rookQueens)
+                                     : Bitboard(0);
 
-    Bitboard threatened = attacks_bb(pc, s, occupied) & occupiedNoK;
-    Bitboard incoming_threats =
-      (PseudoAttacks[KNIGHT][s] & knights) | (PseudoAttacks[KING][s] & kings);
+    Bitboard threatened = attacks_bb(pc, s, occupied) & occupiedNoK & ~excludedVictims;
+    // Kings as attackers have no threat features at all, so they are not recorded.
+    Bitboard incoming_threats = PseudoAttacks[KNIGHT][s] & knights;
 
     // Compute both incoming and outgoing pawn threats. Incoming pawn pushers are only
     // added if 'pc' is a pawn.
@@ -1263,8 +1277,9 @@ void Position::update_piece_threats(Piece               pc,
         incoming_threats |= whiteAttacks & blackPawns;
         incoming_threats |= blackAttacks & whitePawns;
     }
-    else
+    else if (type_of(pc) != BISHOP && type_of(pc) != QUEEN)
     {
+        // Pawn attacks on bishops/queens have no feature; skip recording them
         incoming_threats |=
           (attacks_bb<PAWN>(s, WHITE) & blackPawns) | (attacks_bb<PAWN>(s, BLACK) & whitePawns);
     }
@@ -1274,7 +1289,7 @@ void Position::update_piece_threats(Piece               pc,
     write_multiple_dirties<DirtyThreat::ThreatenedSqOffset, DirtyThreat::ThreatenedPcOffset>(
       *this, threatened, dt_template, dts);
 
-    Bitboard all_attackers = sliders | incoming_threats;
+    Bitboard all_attackers = (sliders & ~directExcluded) | incoming_threats;
 
     dt_template = {NO_PIECE, pc, Square(0), s, putPiece};
     write_multiple_dirties<DirtyThreat::PcSqOffset, DirtyThreat::PcOffset>(*this, all_attackers,
@@ -1302,7 +1317,7 @@ void Position::update_piece_threats(Piece               pc,
     }
     else
     {
-        incoming_threats |= sliders;
+        incoming_threats |= sliders & ~directExcluded;
     }
 
 #ifndef USE_AVX512ICL
